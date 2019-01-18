@@ -161,10 +161,8 @@ enum node_stat_item {
 	NR_SLAB_UNRECLAIMABLE,
 	NR_ISOLATED_ANON,	/* Temporary isolated pages from anon lru */
 	NR_ISOLATED_FILE,	/* Temporary isolated pages from file lru */
-	WORKINGSET_NODES,
 	WORKINGSET_REFAULT,
 	WORKINGSET_ACTIVATE,
-	WORKINGSET_RESTORE,
 	WORKINGSET_NODERECLAIM,
 	NR_ANON_MAPPED,	/* Mapped anonymous pages */
 	NR_FILE_MAPPED,	/* pagecache pages mapped into pagetables.
@@ -182,7 +180,7 @@ enum node_stat_item {
 	NR_VMSCAN_IMMEDIATE,	/* Prioritise for reclaim when writeback ends */
 	NR_DIRTIED,		/* page dirtyings since bootup */
 	NR_WRITTEN,		/* page writings since bootup */
-	NR_KERNEL_MISC_RECLAIMABLE,	/* reclaimable non-slab kernel pages */
+	NR_INDIRECTLY_RECLAIMABLE_BYTES, /* measured in bytes */
 	NR_VM_NODE_STAT_ITEMS
 };
 
@@ -438,6 +436,11 @@ struct zone {
 	unsigned long		managed_pages;
 	unsigned long		spanned_pages;
 	unsigned long		present_pages;
+	
+	unsigned long	nr_100;
+	unsigned long	nr_200;
+	unsigned long	nr_400;
+	unsigned long	nr_800;
 
 	const char		*name;
 
@@ -633,6 +636,9 @@ typedef struct pglist_data {
 	struct page_ext *node_page_ext;
 #endif
 #endif
+#ifndef CONFIG_NO_BOOTMEM
+	struct bootmem_data *bdata;
+#endif
 #if defined(CONFIG_MEMORY_HOTPLUG) || defined(CONFIG_DEFERRED_STRUCT_PAGE_INIT)
 	/*
 	 * Must be held any time you expect node_start_pfn, node_present_pages
@@ -666,6 +672,16 @@ typedef struct pglist_data {
 	enum zone_type kcompactd_classzone_idx;
 	wait_queue_head_t kcompactd_wait;
 	struct task_struct *kcompactd;
+#endif
+#ifdef CONFIG_NUMA_BALANCING
+	/* Lock serializing the migrate rate limiting window */
+	spinlock_t numabalancing_migrate_lock;
+
+	/* Rate limiting time interval */
+	unsigned long numabalancing_migrate_next_window;
+
+	/* Number of pages migrated during the rate limiting time interval */
+	unsigned long numabalancing_migrate_nr_pages;
 #endif
 	/*
 	 * This is a per-node reserve of pages that are not available
@@ -708,6 +724,12 @@ typedef struct pglist_data {
 
 	ZONE_PADDING(_pad2_)
 
+	/*kwonje*/
+	atomic_t nr_pages_100;
+	atomic_t nr_pages_200;
+	atomic_t nr_pages_400;
+	atomic_t nr_pages_800;
+
 	/* Per-node vmstats */
 	struct per_cpu_nodestat __percpu *per_cpu_nodestats;
 	atomic_long_t		vm_stat[NR_VM_NODE_STAT_ITEMS];
@@ -743,6 +765,25 @@ static inline bool pgdat_is_empty(pg_data_t *pgdat)
 {
 	return !pgdat->node_start_pfn && !pgdat->node_spanned_pages;
 }
+
+static inline int zone_id(const struct zone *zone)
+{
+	struct pglist_data *pgdat = zone->zone_pgdat;
+
+	return zone - pgdat->node_zones;
+}
+
+#ifdef CONFIG_ZONE_DEVICE
+static inline bool is_dev_zone(const struct zone *zone)
+{
+	return zone_id(zone) == ZONE_DEVICE;
+}
+#else
+static inline bool is_dev_zone(const struct zone *zone)
+{
+	return false;
+}
+#endif
 
 #include <linux/memory_hotplug.h>
 
@@ -783,12 +824,6 @@ void memory_present(int nid, unsigned long start, unsigned long end);
 static inline void memory_present(int nid, unsigned long start, unsigned long end) {}
 #endif
 
-#if defined(CONFIG_SPARSEMEM)
-void memblocks_present(void);
-#else
-static inline void memblocks_present(void) {}
-#endif
-
 #ifdef CONFIG_HAVE_MEMORYLESS_NODES
 int local_memory_node(int node_id);
 #else
@@ -799,18 +834,6 @@ static inline int local_memory_node(int node_id) { return node_id; };
  * zone_idx() returns 0 for the ZONE_DMA zone, 1 for the ZONE_NORMAL zone, etc.
  */
 #define zone_idx(zone)		((zone) - (zone)->zone_pgdat->node_zones)
-
-#ifdef CONFIG_ZONE_DEVICE
-static inline bool is_dev_zone(const struct zone *zone)
-{
-	return zone_idx(zone) == ZONE_DEVICE;
-}
-#else
-static inline bool is_dev_zone(const struct zone *zone)
-{
-	return false;
-}
-#endif
 
 /*
  * Returns true if a zone has pages managed by the buddy allocator.
@@ -828,25 +851,6 @@ static inline bool populated_zone(struct zone *zone)
 {
 	return zone->present_pages;
 }
-
-#ifdef CONFIG_NUMA
-static inline int zone_to_nid(struct zone *zone)
-{
-	return zone->node;
-}
-
-static inline void zone_set_nid(struct zone *zone, int nid)
-{
-	zone->node = nid;
-}
-#else
-static inline int zone_to_nid(struct zone *zone)
-{
-	return 0;
-}
-
-static inline void zone_set_nid(struct zone *zone, int nid) {}
-#endif
 
 extern int movable_zone;
 
@@ -872,7 +876,7 @@ static inline int is_highmem_idx(enum zone_type idx)
 }
 
 /**
- * is_highmem - helper function to quickly check if a struct zone is a
+ * is_highmem - helper function to quickly check if a struct zone is a 
  *              highmem zone or not.  This is an attempt to keep references
  *              to ZONE_{DMA/NORMAL/HIGHMEM/etc} in general code to a minimum.
  * @zone - pointer to struct zone variable
@@ -963,7 +967,12 @@ static inline int zonelist_zone_idx(struct zoneref *zoneref)
 
 static inline int zonelist_node_idx(struct zoneref *zoneref)
 {
-	return zone_to_nid(zoneref->zone);
+#ifdef CONFIG_NUMA
+	/* zone_to_nid not available in this context */
+	return zoneref->zone->node;
+#else
+	return 0;
+#endif /* CONFIG_NUMA */
 }
 
 struct zoneref *__next_zones_zonelist(struct zoneref *z,

@@ -204,6 +204,11 @@ struct page {
 #ifdef LAST_CPUPID_NOT_IN_PAGE_FLAGS
 	int _last_cpupid;
 #endif
+
+/*kwonje*/
+short int weight;
+short int weight_ref;
+
 } _struct_page_alignment;
 
 /*
